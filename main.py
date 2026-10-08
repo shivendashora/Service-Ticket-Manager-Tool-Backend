@@ -48,6 +48,9 @@ GOOGLE_REDIRECT_URI = os.getenv("GOOGLE_REDIRECT_URI")
 
 DB_URL = os.getenv("DB_URL")
 
+# Where the React app lives: allowed by CORS and where Google login redirects back to
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:5173").rstrip("/")
+
 UPLOAD_DIR = Path(
     os.getenv("UPLOAD_DIR", Path(__file__).parent / "uploads")
 )
@@ -70,7 +73,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:5173"
+        FRONTEND_URL
     ],
     allow_credentials=True,
     allow_methods=["*"],
@@ -478,7 +481,7 @@ async def google_callback(
     # -----------------------------------------------------
 
     response = RedirectResponse(
-        url="http://localhost:5173"
+        url=FRONTEND_URL
     )
 
     response.set_cookie(
