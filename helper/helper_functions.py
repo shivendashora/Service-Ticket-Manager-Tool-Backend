@@ -1,85 +1,180 @@
+import base64
+import logging
 import os
-from typing import List
+from email.message import EmailMessage
 
-from jose import JWTError,jwt
-from datetime import datetime, timedelta
 from dotenv import load_dotenv
-from passlib.context import CryptContext
-
-from models.main_models import Forms, PopulatedFormData
+from google.oauth2.credentials import Credentials
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 
 load_dotenv()
 
-secret_key = os.getenv("SECRET_KEY")
-algorithm = os.getenv("algorithm")
-token_expiry_time = os.getenv("token_expiry_time")
-pwd_context = CryptContext(
-    schemes=["bcrypt"],
-    deprecated="auto"
-)
+logger = logging.getLogger(__name__)
+
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
+GOOGLE_TOKEN_URI = "https://oauth2.googleapis.com/token"
+
+STATUS_LABELS = {
+    "open": "Open",
+    "in_progress": "In progress",
+    "resolved": "Resolved",
+    "closed": "Closed",
+}
 
 
-def hashed_password(password: str):
-    return pwd_context.hash(password)
+def get_gmail_credentials() -> Credentials | None:
 
+    # Built from a refresh token stored in .env (created once with
+    # scripts/get_gmail_refresh_token.py). google-auth swaps it for a
+    # short-lived access token automatically whenever one is needed.
+    refresh_token = os.getenv("GMAIL_REFRESH_TOKEN")
+    client_id = os.getenv("GMAIL_CLIENT_ID")
+    client_secret = os.getenv("GMAIL_CLIENT_SECRET")
 
-def verify_password(password: str, hashed_password: str):
-    return pwd_context.verify(password, hashed_password)
+    if not (refresh_token and client_id and client_secret):
+        return None
 
-
-def generate_token(user_id: int):
-    payload = {
-        "user_id": user_id,
-        "exp": datetime.utcnow() + timedelta(minutes=int(token_expiry_time))
-    }
-
-    token = jwt.encode(
-        payload,
-        secret_key,
-        algorithm=algorithm
+    return Credentials(
+        token=None,
+        refresh_token=refresh_token,
+        token_uri=GOOGLE_TOKEN_URI,
+        client_id=client_id,
+        client_secret=client_secret,
+        scopes=GMAIL_SCOPES,
     )
 
-    return token
 
-def parse_user_data(token: str):
-    return jwt.decode(
-        token,
-        secret_key,
-        algorithms=[algorithm]
+def gmail_send_message(to: list[str], subject: str, body: str):
+    """Send a plain-text email from GMAIL_SENDER through the Gmail API.
+
+    Returns the sent message (including its id), or None if it wasn't sent.
+    Never raises: this runs as a background task, after the response is sent.
+    """
+
+    recipients = sorted({address for address in to if address})
+
+    if not recipients:
+        return None
+
+    creds = get_gmail_credentials()
+    sender = os.getenv("GMAIL_SENDER")
+
+    if not creds or not sender:
+        logger.warning("Gmail is not configured, skipping email: %s", subject)
+        return None
+
+    try:
+        service = build("gmail", "v1", credentials=creds, cache_discovery=False)
+        message = EmailMessage()
+
+        message.set_content(body)
+
+        message["To"] = ", ".join(recipients)
+        message["From"] = sender
+        message["Subject"] = subject
+
+        # encoded message
+        encoded_message = base64.urlsafe_b64encode(message.as_bytes()).decode()
+
+        create_message = {"raw": encoded_message}
+        # pylint: disable=E1101
+        send_message = (
+            service.users()
+            .messages()
+            .send(userId="me", body=create_message)
+            .execute()
+        )
+        logger.info("Email sent, message id: %s", send_message["id"])
+        print(f"Email sent: \"{subject}\" to {', '.join(recipients)} (message id: {send_message['id']})")
+
+    except HttpError as error:
+        logger.error("Gmail API error: %s", error)
+        send_message = None
+
+    except Exception:
+        # e.g. the refresh token was revoked or expired
+        logger.exception("Could not send email: %s", subject)
+        send_message = None
+
+    return send_message
+
+
+def ticket_code(ticket_id: int) -> str:
+    return f"#{ticket_id:04d}"
+
+
+def ticket_created_mail(
+    ticket_id: int,
+    title: str,
+    description: str,
+    created_by_name: str,
+    recipients: list[str]
+):
+
+    subject = f"New ticket {ticket_code(ticket_id)}: {title}"
+
+    body = (
+        "Hi,\n\n"
+        f"A new ticket was created by {created_by_name}.\n\n"
+        f"Ticket: {ticket_code(ticket_id)} \"{title}\"\n"
+        "Status: Open\n\n"
+        f"{description}\n\n"
+        "- SupportDesk"
     )
 
-def parse_form_data(form_structure):
-    def parse_inputs(inputs):
-        parsed_inputs = []
-
-        for input_field in inputs:
-            parsed_input = {
-                "input_id": input_field.input_id,
-                "children": parse_inputs(input_field.children)
-            }
-
-            parsed_inputs.append(parsed_input)
-
-        return parsed_inputs
-
-    return parse_inputs(form_structure)
+    gmail_send_message(recipients, subject, body)
 
 
-def parse_form_data(form_data: List[PopulatedFormData]):
-    parsed_data = {}
+def ticket_assigned_mail(
+    tickets: list[tuple[int, str]],
+    assignee_name: str,
+    assigned_by_name: str,
+    recipients: list[str]
+):
 
-    def parse_input(input_data: PopulatedFormData):
-        parsed_data[input_data.input_id] = input_data.value
+    # One email per assign request, even when several tickets are assigned at once
+    if len(tickets) == 1:
+        ticket_id = tickets[0][0]
+        subject = f"Ticket {ticket_code(ticket_id)} assigned to {assignee_name}"
+    else:
+        subject = f"{len(tickets)} tickets assigned to {assignee_name}"
 
-        for child in input_data.children:
-            parse_input(child)
+    ticket_lines = "\n".join(
+        f"  {ticket_code(ticket_id)} \"{title}\"" for ticket_id, title in tickets
+    )
 
-    for input_data in form_data:
-        parse_input(input_data)
+    body = (
+        f"Hi {assignee_name},\n\n"
+        f"{assigned_by_name} assigned you the following ticket(s):\n\n"
+        f"{ticket_lines}\n\n"
+    )
 
-    return parsed_data
-    
+    gmail_send_message(recipients, subject, body)
 
 
-    
+def update_ticket_status_on_mail(
+    ticket_id: int,
+    title: str,
+    new_status: str,
+    updated_by_name: str,
+    updated_by_email: str,
+    recipients: list[str]
+):
 
+    status = STATUS_LABELS.get(new_status, new_status)
+    completed = new_status in ("resolved", "closed")
+
+    if completed:
+        subject = f"Ticket {ticket_code(ticket_id)} completed ({status})"
+    else:
+        subject = f"Ticket {ticket_code(ticket_id)} is now {status}"
+
+    body = (
+        "Hi,\n\n"
+        f"The status of ticket {ticket_code(ticket_id)} \"{title}\" was changed to {status}.\n\n"
+        f"Changed by: {updated_by_name} <{updated_by_email}>\n\n"
+        "- SupportDesk"
+    )
+
+    gmail_send_message(recipients, subject, body)

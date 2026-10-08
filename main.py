@@ -4,7 +4,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Request, Form, File, UploadFile
+from fastapi import FastAPI, Depends, HTTPException, Request, Form, File, UploadFile,BackgroundTasks
 from fastapi.responses import JSONResponse, RedirectResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, HttpUrl, TypeAdapter, ValidationError
@@ -25,6 +25,11 @@ from models.main_models import (
     UserRole,
 )
 from tables.main_tables import Base, Users, Tickets, TicketAttachments, assignee
+from helper.helper_functions import (
+    ticket_created_mail,
+    ticket_assigned_mail,
+    update_ticket_status_on_mail,
+)
 
 
 # ---------------------------------------------------------
@@ -829,6 +834,23 @@ def can_view_ticket(db: Session, ticket_id: int, user: Users) -> bool:
 
 
 # ---------------------------------------------------------
+# EMAIL HELPERS
+# ---------------------------------------------------------
+
+def get_ticket_recipient_emails(db: Session, ticket: Tickets) -> list[str]:
+
+    # Everyone involved in a ticket: the admin who created it and its assignees
+    emails = [user.email for _, user in get_active_assignments(db, [ticket.id])]
+
+    if ticket.created_by:
+        creator = db.query(Users).filter(Users.id == ticket.created_by).first()
+        if creator:
+            emails.append(creator.email)
+
+    return emails
+
+
+# ---------------------------------------------------------
 # CREATE TICKET
 # ---------------------------------------------------------
 
@@ -837,6 +859,7 @@ def can_view_ticket(db: Session, ticket_id: int, user: Users) -> bool:
 
 @app.post("/tickets", status_code=201)
 def create_ticket(
+    background_tasks: BackgroundTasks,
     title: str = Form(min_length=1),
     description: str = Form(min_length=1),
     estimated_time: int | None = Form(default=None, ge=0),
@@ -877,6 +900,17 @@ def create_ticket(
         raise
 
     db.refresh(ticket)
+
+    # A new ticket has no assignees yet (assigning is a separate request),
+    # so the creator is notified now and assignees when they're assigned
+    background_tasks.add_task(
+        ticket_created_mail,
+        ticket.id,
+        ticket.title,
+        ticket.description,
+        current_user.name,
+        [current_user.email]
+    )
 
     return {
         "message": "Ticket created successfully",
@@ -1092,6 +1126,7 @@ def get_ticket(
 def update_ticket(
     ticket_id: int,
     data: UpdateTicketRequest,
+    background_tasks: BackgroundTasks,
     current_user: Users = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
@@ -1127,11 +1162,27 @@ def update_ticket(
                 detail=f"{field} cannot be null"
             )
 
+    old_status = ticket.status
+
     for field, value in changes.items():
         setattr(ticket, field, value)
 
     db.commit()
     db.refresh(ticket)
+
+    # Runs after the response is sent; only for a saved, real status change.
+    # Plain values are passed because the db session may be closed by then.
+    if "status" in changes and ticket.status != old_status:
+        background_tasks.add_task(
+            update_ticket_status_on_mail,
+            ticket.id,
+            ticket.title,
+            ticket.status,
+            current_user.name,
+            current_user.email,
+            # The creator, every assignee and whoever made the change
+            get_ticket_recipient_emails(db, ticket) + [current_user.email]
+        )
 
     return {
         "message": "Ticket updated successfully",
@@ -1179,6 +1230,7 @@ def delete_ticket(
 @app.post("/assign-tickets")
 def assign_tickets(
     data: AssignTicketsRequest,
+    background_tasks: BackgroundTasks,
     current_user: Users = Depends(require_admin),
     db: Session = Depends(get_db)
 ):
@@ -1206,8 +1258,8 @@ def assign_tickets(
             detail="User to assign not found"
         )
 
-    found_ids = {
-        ticket.id
+    titles_by_id = {
+        ticket.id: ticket.title
         for ticket in db.query(Tickets)
         .filter(
             Tickets.id.in_(assigned_tickets),
@@ -1215,7 +1267,7 @@ def assign_tickets(
         )
         .all()
     }
-    missing_ids = assigned_tickets - found_ids
+    missing_ids = assigned_tickets - set(titles_by_id)
 
     if missing_ids:
         raise HTTPException(
@@ -1245,6 +1297,16 @@ def assign_tickets(
         ))
 
     db.commit()
+
+    # The new task reaches the assigned user, with the assigning admin in copy
+    if newly_assigned:
+        background_tasks.add_task(
+            ticket_assigned_mail,
+            [(ticket_id, titles_by_id[ticket_id]) for ticket_id in newly_assigned],
+            to_user.name,
+            current_user.name,
+            [to_user.email, current_user.email]
+        )
 
     return {
         "message": "tickets assigned successfully",
