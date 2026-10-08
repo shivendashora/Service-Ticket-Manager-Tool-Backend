@@ -120,7 +120,7 @@ def ticket_created_mail(
         f"Ticket: {ticket_code(ticket_id)} \"{title}\"\n"
         "Status: Open\n\n"
         f"{description}\n\n"
-        "- SupportDesk"
+        
     )
 
     gmail_send_message(recipients, subject, body)
@@ -174,7 +174,7 @@ def update_ticket_status_on_mail(
         "Hi,\n\n"
         f"The status of ticket {ticket_code(ticket_id)} \"{title}\" was changed to {status}.\n\n"
         f"Changed by: {updated_by_name} <{updated_by_email}>\n\n"
-        "- SupportDesk"
+        
     )
 
     gmail_send_message(recipients, subject, body)
